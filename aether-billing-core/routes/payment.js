@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 const stripe = require('stripe')(process.env.STRIPE_PLATFORM_SECRET_KEY);
 
+function isValidWebhookUrl(value) {
+    try {
+        const url = new URL(String(value));
+        return url.protocol === 'https:' || url.protocol === 'http:';
+    } catch (error) {
+        return false;
+    }
+}
+
 router.post('/process-payment', async (req, res) => {
     const { paymentMethodId, amount, merchantConnectId, templateWebhookUrl } = req.body;
     const amountInt = Number(amount);
@@ -12,6 +21,10 @@ router.post('/process-payment', async (req, res) => {
 
     if (!Number.isInteger(amountInt) || amountInt <= 0) {
         return res.status(400).json({ success: false, error: 'Amount must be a positive integer in the lowest currency unit.' });
+    }
+
+    if (!isValidWebhookUrl(templateWebhookUrl)) {
+        return res.status(400).json({ success: false, error: 'Template webhook URL must be a valid http(s) URL.' });
     }
 
     try {
@@ -29,7 +42,7 @@ router.post('/process-payment', async (req, res) => {
                 enabled: true,
                 allow_redirects: 'never'
             },
-            application_fee_amount: platformFee,
+            application_fee_amount: finalPlatformFee,
             transfer_data: {
                 destination: merchantConnectId,
             },
@@ -76,8 +89,8 @@ router.get('/stripe/callback', async (req, res) => {
 
         try {
             const stateUrl = new URL(String(state));
-            const base = stateUrl.origin + stateUrl.pathname.replace(/\/$/, '');
-            redirectUrl = `${base}/wp-admin/options-general.php?page=aether-billing&connected_id=${encodeURIComponent(merchantConnectId)}`;
+            stateUrl.searchParams.set('connected_id', merchantConnectId);
+            redirectUrl = stateUrl.toString();
         } catch (redirectError) {
             console.warn('Invalid state URL received from Stripe callback:', state);
             redirectUrl = `${process.env.NODE_BASE_URL || 'http://localhost:5000'}/?connected_id=${encodeURIComponent(merchantConnectId)}`;
