@@ -15,7 +15,10 @@ router.post('/process-payment', async (req, res) => {
     }
 
     try {
-        const platformFee = Math.max(0, Math.round(amountInt * 0.10));
+        // Calculate a strict 1% platform fee securely on the server.
+        // Example: $10.00 checkout = 1000 cents. 1000 * 0.01 = 10 cents platform fee.
+        const platformFee = Math.round(amountInt * 0.01);
+        const finalPlatformFee = platformFee < 1 && amountInt > 0 ? 1 : platformFee;
 
         const paymentIntent = await stripe.paymentIntents.create({
             amount: amountInt,
