@@ -25,5 +25,13 @@ app.get('/', (req, res) => {
     res.send('Aether Billing API is running.');
 });
 
+app.get('/health', (req, res) => {
+    res.json({
+        ok: true,
+        service: 'aether-billing-core',
+        version: '2026-05-16-stripe-callback-fix',
+    });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Aether Engine online on port ${PORT}`));
