@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const stripe = require('stripe')(process.env.STRIPE_PLATFORM_SECRET_KEY);
 
+function getNodeBaseUrl(req) {
+    if (process.env.NODE_BASE_URL) {
+        return process.env.NODE_BASE_URL.replace(/\/$/, '');
+    }
+
+    return `${req.protocol}://${req.get('host')}`;
+}
+
 function isValidWebhookUrl(value) {
     try {
         const url = new URL(String(value));
@@ -10,6 +18,32 @@ function isValidWebhookUrl(value) {
         return false;
     }
 }
+
+router.get('/public-config', (req, res) => {
+    const nodeBaseUrl = getNodeBaseUrl(req);
+    const stripeClientId = process.env.STRIPE_CLIENT_ID || '';
+    const publishableKey = process.env.STRIPE_PLATFORM_PUBLIC_KEY || '';
+    const siteUrl = req.query.site_url ? String(req.query.site_url) : '';
+
+    let connectUrl = '';
+    if (stripeClientId && siteUrl) {
+        connectUrl = `https://connect.stripe.com/oauth/authorize?${new URLSearchParams({
+            response_type: 'code',
+            client_id: stripeClientId,
+            scope: 'read_write',
+            redirect_uri: `${nodeBaseUrl}/api/v1/stripe/callback`,
+            state: siteUrl,
+        }).toString()}`;
+    }
+
+    res.json({
+        service: 'aether-billing-core',
+        mode: publishableKey.startsWith('pk_live_') ? 'live' : 'test',
+        publishableKey,
+        connectUrl,
+        callbackUrl: `${nodeBaseUrl}/api/v1/stripe/callback`,
+    });
+});
 
 router.post('/process-payment', async (req, res) => {
     const { paymentMethodId, amount, merchantConnectId, templateWebhookUrl } = req.body;
