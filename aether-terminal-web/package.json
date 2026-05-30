@@ -1,0 +1,32 @@
+{
+  "name": "aether-terminal-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "prestart": "node --input-type=module -e \"import fs from 'fs'; if (!fs.existsSync('dist/index.html')) { console.error('Run npm run build before npm start'); process.exit(1); }\"",
+    "postbuild": "node --input-type=module -e \"import fs from 'fs'; fs.accessSync('dist/index.html'); console.log('dist/ ready');\""
+  },
+  "dependencies": {
+    "@stripe/react-stripe-js": "^3.1.0",
+    "@stripe/stripe-js": "^5.5.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vite-plugin-pwa": "^0.21.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

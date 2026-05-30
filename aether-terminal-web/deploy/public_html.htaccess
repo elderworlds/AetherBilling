@@ -1,0 +1,6 @@
+﻿PassengerAppRoot /home/u454645708/domains/terminal.aetherframeworks.dev/nodejs
+PassengerAppType node
+PassengerNodejs /opt/alt/alt-nodejs22/root/bin/node
+PassengerStartupFile server.js
+PassengerBaseURI /
+PassengerRestartDir /home/u454645708/domains/terminal.aetherframeworks.dev/nodejs/tmp
