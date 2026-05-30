@@ -10,8 +10,10 @@ const {
     buildConnectUrl,
 } = require('../lib/urls');
 const { getSiteByStripeAccount, fetchWordPressJson } = require('../lib/sites');
-const { splitInstallments, nextDueDates, INSTALLMENT_COUNT } = require('../lib/installments');
+const { splitInstallments, nextDueDates, INSTALLMENT_COUNT, resolveIntervalDays } = require('../lib/installments');
 const { createInstallmentPlan } = require('../lib/installment-plans');
+const { saveFirstPaymentMethodFromIntent } = require('../lib/installment-collector');
+const { normalizeEmail, queuePlanCreatedEmail } = require('../lib/installment-emails');
 
 const APP_DEEP_LINK = 'aetherterminal://account';
 
@@ -19,8 +21,21 @@ const APP_DEEP_LINK = 'aetherterminal://account';
  * Mobile POS (Tap to Pay) — direct charges on the connected account.
  * @see https://docs.stripe.com/terminal/features/connect
  */
+function isValidReturnUrl(value) {
+    try {
+        const url = new URL(String(value));
+        return url.protocol === 'https:' || url.protocol === 'http:';
+    } catch {
+        return false;
+    }
+}
+
 router.get('/onboarding-url', (req, res) => {
-    const connectUrl = buildConnectUrl(req, terminalOAuthReturnUrl(req));
+    const returnOverride = req.query.return_url ? String(req.query.return_url) : '';
+    const oauthState = isValidReturnUrl(returnOverride)
+        ? returnOverride
+        : terminalOAuthReturnUrl(req);
+    const connectUrl = buildConnectUrl(req, oauthState);
     if (!connectUrl) {
         return res.status(503).json({
             success: false,
@@ -30,7 +45,7 @@ router.get('/onboarding-url', (req, res) => {
     return res.json({
         success: true,
         connectUrl,
-        returnUrl: terminalOAuthReturnUrl(req),
+        returnUrl: oauthState,
     });
 });
 
@@ -83,10 +98,11 @@ router.get('/config', (req, res) => {
     return res.json({
         success: true,
         mode: publishableKey.startsWith('pk_live_') ? 'live' : 'test',
-        currency: (process.env.STRIPE_DEFAULT_CURRENCY || 'eur').toLowerCase(),
-        country: (process.env.STRIPE_DEFAULT_COUNTRY || 'IE').toUpperCase(),
+        currency: (process.env.STRIPE_DEFAULT_CURRENCY || 'usd').toLowerCase(),
+        country: (process.env.STRIPE_DEFAULT_COUNTRY || 'US').toUpperCase(),
         applicationFeePercent: 1,
         billingUrl: getNodeBaseUrl(req),
+        publishableKey,
     });
 });
 
@@ -155,16 +171,26 @@ router.get('/catalog', async (req, res) => {
 });
 
 router.post('/pos-order', async (req, res) => {
-    const { merchantConnectId, lineItems, paymentIntentId, currency, payIn4 } = req.body;
+    const {
+        merchantConnectId,
+        lineItems,
+        paymentIntentId,
+        currency,
+        payIn4,
+        customAmountCents,
+        customerEmail,
+    } = req.body;
+    const customCents = Number(customAmountCents) || 0;
+    const items = Array.isArray(lineItems) ? lineItems : [];
 
     if (!merchantConnectId || !String(merchantConnectId).startsWith('acct_')) {
         return res.status(400).json({ success: false, error: 'merchantConnectId (acct_...) is required.' });
     }
 
-    if (!paymentIntentId || !Array.isArray(lineItems) || !lineItems.length) {
+    if (!paymentIntentId || (!items.length && customCents <= 0)) {
         return res.status(400).json({
             success: false,
-            error: 'paymentIntentId and lineItems are required.',
+            error: 'paymentIntentId and lineItems or customAmountCents are required.',
         });
     }
 
@@ -177,12 +203,13 @@ router.post('/pos-order', async (req, res) => {
             });
         }
 
-        const chargeCurrency = currency || process.env.STRIPE_DEFAULT_CURRENCY || 'eur';
+        const chargeCurrency = currency || process.env.STRIPE_DEFAULT_CURRENCY || 'usd';
         let installmentPayload = null;
 
         if (payIn4 && payIn4.totalCents) {
+            const intervalDays = resolveIntervalDays(payIn4);
             const amounts = splitInstallments(payIn4.totalCents);
-            const dueDates = nextDueDates();
+            const dueDates = nextDueDates(new Date(), INSTALLMENT_COUNT, intervalDays);
             installmentPayload = {
                 planId: null,
                 totalCents: payIn4.totalCents,
@@ -190,22 +217,33 @@ router.post('/pos-order', async (req, res) => {
                 paidInstallments: 1,
                 installmentCount: INSTALLMENT_COUNT,
                 nextDueAt: dueDates[0] || null,
-                intervalDays: 14,
+                intervalDays,
             };
+        }
+
+        const orderBody = {
+            lineItems: items,
+            paymentIntentId,
+            currency: chargeCurrency,
+            payIn4: installmentPayload,
+        };
+        if (customCents > 0) {
+            orderBody.customAmountCents = customCents;
+        }
+        const normalizedEmail = normalizeEmail(customerEmail);
+        if (normalizedEmail) {
+            orderBody.customerEmail = normalizedEmail;
         }
 
         const data = await fetchWordPressJson(site, '/wp-json/aether/v1/pos-order', {
             method: 'POST',
-            body: {
-                lineItems,
-                paymentIntentId,
-                currency: chargeCurrency,
-                payIn4: installmentPayload,
-            },
+            body: orderBody,
         });
 
         let plan = null;
         if (installmentPayload) {
+            const planEmail =
+                normalizedEmail || normalizeEmail(data.customerEmail) || null;
             plan = await createInstallmentPlan({
                 merchantConnectId,
                 siteUrl: site.site_url,
@@ -215,8 +253,25 @@ router.post('/pos-order', async (req, res) => {
                 installmentAmounts: installmentPayload.installmentAmounts,
                 paymentIntentId,
                 nextDueAt: installmentPayload.nextDueAt,
+                intervalDays: installmentPayload.intervalDays,
+                customerEmail: planEmail,
             });
             installmentPayload.planId = plan.planId;
+
+            try {
+                await saveFirstPaymentMethodFromIntent(
+                    plan.planId,
+                    paymentIntentId,
+                    merchantConnectId
+                );
+            } catch (saveErr) {
+                console.warn('Could not save PM from first installment:', saveErr.message);
+            }
+
+            queuePlanCreatedEmail(plan.planId, {
+                customerEmail: planEmail,
+                orderNumber: data.orderNumber,
+            });
         }
 
         return res.json({
@@ -251,10 +306,18 @@ router.post('/connection-token', async (req, res) => {
     }
 });
 
-router.post('/payment-intent', async (req, res) => {
-    const { amount, merchantConnectId, currency, metadata } = req.body;
+router.post('/web/payment-intent', async (req, res) => {
+    const {
+        amount,
+        merchantConnectId,
+        currency,
+        metadata,
+        saveForFutureUsage,
+        planId,
+        stripeCustomerId,
+    } = req.body;
     const amountInt = Number(amount);
-    const chargeCurrency = (currency || process.env.STRIPE_DEFAULT_CURRENCY || 'eur').toLowerCase();
+    const chargeCurrency = (currency || process.env.STRIPE_DEFAULT_CURRENCY || 'usd').toLowerCase();
 
     if (!merchantConnectId || !String(merchantConnectId).startsWith('acct_')) {
         return res.status(400).json({ success: false, error: 'merchantConnectId (acct_...) is required.' });
@@ -266,23 +329,54 @@ router.post('/payment-intent', async (req, res) => {
 
     try {
         const platformFee = applicationFeeAmount(amountInt);
+        const isPayIn4 = saveForFutureUsage === true || metadata?.aether_pay_in_4 === 'yes';
+        const isInstallmentCollect = Boolean(planId);
 
-        const paymentIntent = await stripe.paymentIntents.create(
-            {
-                amount: amountInt,
-                currency: chargeCurrency,
-                payment_method_types: ['card_present'],
-                capture_method: 'automatic',
-                application_fee_amount: platformFee,
-                metadata: {
-                    ...(metadata || {}),
-                    aether_application_fee_bps: '100',
-                    aether_application_fee_amount: String(platformFee),
-                    aether_channel: 'terminal_tap_to_pay',
+        let customerId = stripeCustomerId || null;
+        if (isPayIn4 && !customerId) {
+            const customer = await stripe.customers.create(
+                {
+                    metadata: {
+                        aether_channel: 'web_pay_in_4',
+                        aether_merchant: merchantConnectId,
+                    },
                 },
+                { stripeAccount: merchantConnectId }
+            );
+            customerId = customer.id;
+        }
+
+        const piParams = {
+            amount: amountInt,
+            currency: chargeCurrency,
+            automatic_payment_methods: { enabled: true },
+            capture_method: 'automatic',
+            application_fee_amount: platformFee,
+            metadata: {
+                ...(metadata || {}),
+                aether_application_fee_bps: '100',
+                aether_application_fee_amount: String(platformFee),
+                aether_channel: isInstallmentCollect
+                    ? 'web_installment_collect'
+                    : isPayIn4
+                      ? 'web_pay_in_4'
+                      : 'web_checkout',
             },
-            { stripeAccount: merchantConnectId }
-        );
+        };
+
+        if (isPayIn4 || isInstallmentCollect) {
+            piParams.setup_future_usage = 'off_session';
+        }
+        if (customerId) {
+            piParams.customer = customerId;
+        }
+        if (planId) {
+            piParams.metadata.aether_plan_id = String(planId);
+        }
+
+        const paymentIntent = await stripe.paymentIntents.create(piParams, {
+            stripeAccount: merchantConnectId,
+        });
 
         return res.json({
             success: true,
@@ -290,6 +384,93 @@ router.post('/payment-intent', async (req, res) => {
             clientSecret: paymentIntent.client_secret,
             applicationFeeAmount: platformFee,
             currency: chargeCurrency,
+            stripeCustomerId: customerId,
+        });
+    } catch (error) {
+        console.error('Terminal web PaymentIntent failed:', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/payment-intent', async (req, res) => {
+    const {
+        amount,
+        merchantConnectId,
+        currency,
+        metadata,
+        saveForFutureUsage,
+        planId,
+        stripeCustomerId,
+    } = req.body;
+    const amountInt = Number(amount);
+    const chargeCurrency = (currency || process.env.STRIPE_DEFAULT_CURRENCY || 'usd').toLowerCase();
+
+    if (!merchantConnectId || !String(merchantConnectId).startsWith('acct_')) {
+        return res.status(400).json({ success: false, error: 'merchantConnectId (acct_...) is required.' });
+    }
+
+    if (!Number.isInteger(amountInt) || amountInt <= 0) {
+        return res.status(400).json({ success: false, error: 'Amount must be a positive integer in the lowest currency unit.' });
+    }
+
+    try {
+        const platformFee = applicationFeeAmount(amountInt);
+        const isPayIn4 = saveForFutureUsage === true || metadata?.aether_pay_in_4 === 'yes';
+        const isInstallmentCollect = Boolean(planId);
+
+        let customerId = stripeCustomerId || null;
+        if (isPayIn4 && !customerId) {
+            const customer = await stripe.customers.create(
+                {
+                    metadata: {
+                        aether_channel: 'terminal_pay_in_4',
+                        aether_merchant: merchantConnectId,
+                    },
+                },
+                { stripeAccount: merchantConnectId }
+            );
+            customerId = customer.id;
+        }
+
+        const piParams = {
+            amount: amountInt,
+            currency: chargeCurrency,
+            payment_method_types: ['card_present'],
+            capture_method: 'automatic',
+            application_fee_amount: platformFee,
+            metadata: {
+                ...(metadata || {}),
+                aether_application_fee_bps: '100',
+                aether_application_fee_amount: String(platformFee),
+                aether_channel: isInstallmentCollect
+                    ? 'terminal_installment_collect'
+                    : isPayIn4
+                      ? 'terminal_pay_in_4'
+                      : 'terminal_tap_to_pay',
+            },
+        };
+
+        if (isPayIn4 || isInstallmentCollect) {
+            piParams.setup_future_usage = 'off_session';
+        }
+        if (customerId) {
+            piParams.customer = customerId;
+        }
+        if (planId) {
+            piParams.metadata.aether_plan_id = String(planId);
+        }
+
+        const paymentIntent = await stripe.paymentIntents.create(piParams, {
+            stripeAccount: merchantConnectId,
+        });
+
+        return res.json({
+            success: true,
+            paymentIntentId: paymentIntent.id,
+            clientSecret: paymentIntent.client_secret,
+            applicationFeeAmount: platformFee,
+            currency: chargeCurrency,
+            stripeCustomerId: customerId,
         });
     } catch (error) {
         console.error('Terminal PaymentIntent failed:', error.message);

@@ -14,7 +14,7 @@ function getNodeBaseUrl(req) {
 }
 
 function defaultTerminalAddress() {
-    const country = (process.env.STRIPE_DEFAULT_COUNTRY || 'IE').toUpperCase();
+    const country = (process.env.STRIPE_DEFAULT_COUNTRY || 'US').toUpperCase();
     const byCountry = {
         IE: {
             line1: '1 OConnell Street',

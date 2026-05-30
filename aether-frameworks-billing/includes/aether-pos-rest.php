@@ -33,7 +33,7 @@ function aether_pos_store_info() {
         'siteUrl' => home_url('/'),
         'currency' => function_exists('get_woocommerce_currency')
             ? get_woocommerce_currency()
-            : 'EUR',
+            : 'USD',
     ));
 }
 
@@ -88,9 +88,15 @@ function aether_pos_create_order(WP_REST_Request $request) {
     $line_items = isset($params['lineItems']) && is_array($params['lineItems']) ? $params['lineItems'] : array();
     $payment_intent_id = isset($params['paymentIntentId']) ? sanitize_text_field($params['paymentIntentId']) : '';
     $currency = isset($params['currency']) ? sanitize_text_field($params['currency']) : get_woocommerce_currency();
+    $custom_amount_cents = isset($params['customAmountCents']) ? absint($params['customAmountCents']) : 0;
+    $customer_email = isset($params['customerEmail']) ? sanitize_email($params['customerEmail']) : '';
 
-    if (empty($line_items) || empty($payment_intent_id)) {
-        return new WP_REST_Response(array('success' => false, 'error' => 'lineItems and paymentIntentId are required.'), 400);
+    if (empty($payment_intent_id)) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'paymentIntentId is required.'), 400);
+    }
+
+    if (empty($line_items) && $custom_amount_cents <= 0) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'lineItems or customAmountCents is required.'), 400);
     }
 
     try {
@@ -124,8 +130,19 @@ function aether_pos_create_order(WP_REST_Request $request) {
             $order->add_product($product, $quantity);
         }
 
+        if ($custom_amount_cents > 0) {
+            $fee = new WC_Order_Item_Fee();
+            $fee->set_name('POS custom charge');
+            $fee->set_total($custom_amount_cents / 100);
+            $order->add_item($fee);
+        }
+
         if (!$order->get_item_count()) {
             return new WP_REST_Response(array('success' => false, 'error' => 'No valid line items.'), 400);
+        }
+
+        if ($customer_email && is_email($customer_email)) {
+            $order->set_billing_email($customer_email);
         }
 
         $order->set_currency($currency);
@@ -147,6 +164,9 @@ function aether_pos_create_order(WP_REST_Request $request) {
             }
             if (!empty($pay_in_4['nextDueAt'])) {
                 $order->update_meta_data('_aether_installment_next_due', sanitize_text_field($pay_in_4['nextDueAt']));
+            }
+            if (!empty($pay_in_4['intervalDays'])) {
+                $order->update_meta_data('_aether_installment_interval_days', absint($pay_in_4['intervalDays']));
             }
             $order->set_status('on-hold');
             $first_cents = isset($pay_in_4['installmentAmounts'][0]) ? absint($pay_in_4['installmentAmounts'][0]) : 0;
@@ -178,6 +198,7 @@ function aether_pos_create_order(WP_REST_Request $request) {
             'success' => true,
             'orderId' => $order->get_id(),
             'orderNumber' => $order->get_order_number(),
+            'customerEmail' => $order->get_billing_email(),
         ));
     } catch (Exception $exception) {
         return new WP_REST_Response(array(
@@ -185,6 +206,100 @@ function aether_pos_create_order(WP_REST_Request $request) {
             'error' => $exception->getMessage(),
         ), 500);
     }
+}
+
+function aether_pos_get_order(WP_REST_Request $request) {
+    if (!function_exists('wc_get_order')) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'WooCommerce is not active.'), 503);
+    }
+
+    $order_id = absint($request->get_param('id'));
+    $order = wc_get_order($order_id);
+
+    if (!$order) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'Order not found.'), 404);
+    }
+
+    return rest_ensure_response(array(
+        'success' => true,
+        'orderId' => $order->get_id(),
+        'orderNumber' => $order->get_order_number(),
+        'customerEmail' => $order->get_billing_email(),
+    ));
+}
+
+function aether_pos_record_installment(WP_REST_Request $request) {
+    if (!function_exists('wc_get_order')) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'WooCommerce is not active.'), 503);
+    }
+
+    $order_id = absint($request->get_param('id'));
+    $order = wc_get_order($order_id);
+
+    if (!$order) {
+        return new WP_REST_Response(array('success' => false, 'error' => 'Order not found.'), 404);
+    }
+
+    $params = $request->get_json_params();
+    $paid_count = isset($params['paidCount']) ? absint($params['paidCount']) : 0;
+    $installment_count = isset($params['installmentCount']) ? absint($params['installmentCount']) : 4;
+    $installment_number = isset($params['installmentNumber']) ? absint($params['installmentNumber']) : $paid_count;
+    $next_due = isset($params['nextDueAt']) ? sanitize_text_field($params['nextDueAt']) : '';
+    $payment_intent_id = isset($params['paymentIntentId']) ? sanitize_text_field($params['paymentIntentId']) : '';
+    $is_complete = !empty($params['isComplete']);
+    $channel = isset($params['channel']) ? sanitize_text_field($params['channel']) : 'billing';
+    $amount_cents = isset($params['amountCents']) ? absint($params['amountCents']) : 0;
+    $interval_days = isset($params['intervalDays']) ? absint($params['intervalDays']) : 0;
+    $currency = $order->get_currency();
+
+    if ($interval_days > 0) {
+        $order->update_meta_data('_aether_installment_interval_days', $interval_days);
+    }
+    $order->update_meta_data('_aether_installment_paid_count', $paid_count);
+    if ($next_due) {
+        $order->update_meta_data('_aether_installment_next_due', $next_due);
+    } else {
+        $order->delete_meta_data('_aether_installment_next_due');
+    }
+
+    $channel_label = $channel === 'auto_charge'
+        ? 'auto-charge'
+        : ($channel === 'terminal' || $channel === 'terminal_installment_collect'
+            ? 'Terminal Tap to Pay'
+            : ($channel === 'payment_link' ? 'payment link' : $channel));
+
+    $amount_display = $amount_cents > 0
+        ? wc_price($amount_cents / 100, array('currency' => $currency))
+        : '—';
+
+    $order->add_order_note(
+        sprintf(
+            'Aether Pay in 4 — installment %d/%d collected via %s (%s).%s PaymentIntent: %s',
+            $installment_number,
+            $installment_count,
+            $channel_label,
+            $amount_display,
+            $is_complete ? ' Plan complete.' : ($next_due ? ' Next due: ' . $next_due . '.' : ''),
+            $payment_intent_id
+        )
+    );
+
+    if ($is_complete) {
+        $order->payment_complete($payment_intent_id);
+        $order->set_status('processing');
+    } else {
+        $order->set_status('on-hold');
+    }
+
+    $order->save();
+
+    return rest_ensure_response(array(
+        'success' => true,
+        'orderId' => $order->get_id(),
+        'orderNumber' => $order->get_order_number(),
+        'paidCount' => $paid_count,
+        'isComplete' => $is_complete,
+    ));
 }
 
 function aether_pos_register_rest_routes() {
@@ -204,6 +319,34 @@ function aether_pos_register_rest_routes() {
         'methods' => 'POST',
         'callback' => 'aether_pos_create_order',
         'permission_callback' => 'aether_pos_permission',
+    ));
+
+    register_rest_route('aether/v1', '/pos-order/(?P<id>\d+)', array(
+        'methods' => 'GET',
+        'callback' => 'aether_pos_get_order',
+        'permission_callback' => 'aether_pos_permission',
+        'args' => array(
+            'id' => array(
+                'required' => true,
+                'validate_callback' => function ($value) {
+                    return is_numeric($value) && absint($value) > 0;
+                },
+            ),
+        ),
+    ));
+
+    register_rest_route('aether/v1', '/pos-order/(?P<id>\d+)/installment', array(
+        'methods' => 'POST',
+        'callback' => 'aether_pos_record_installment',
+        'permission_callback' => 'aether_pos_permission',
+        'args' => array(
+            'id' => array(
+                'required' => true,
+                'validate_callback' => function ($value) {
+                    return is_numeric($value) && absint($value) > 0;
+                },
+            ),
+        ),
     ));
 }
 

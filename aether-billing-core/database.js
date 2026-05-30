@@ -54,10 +54,39 @@ const db = new sqlite3.Database(dbPath, (err) => {
                 payment_intent_ids TEXT,
                 next_due_at TEXT,
                 status TEXT DEFAULT 'active',
+                stripe_customer_id TEXT,
+                stripe_payment_method_id TEXT,
+                payment_link_url TEXT,
+                last_charge_error TEXT,
+                last_payment_link_at TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
+
+            migrateInstallmentPlanColumns();
         });
     }
 });
+
+function migrateInstallmentPlanColumns() {
+    const columns = [
+        ['stripe_customer_id', 'TEXT'],
+        ['stripe_payment_method_id', 'TEXT'],
+        ['payment_link_url', 'TEXT'],
+        ['last_charge_error', 'TEXT'],
+        ['last_payment_link_at', 'TEXT'],
+        ['interval_days', 'INTEGER'],
+        ['customer_email', 'TEXT'],
+    ];
+
+    db.all(`PRAGMA table_info(installment_plans)`, (err, rows) => {
+        if (err || !rows) return;
+        const existing = new Set(rows.map((r) => r.name));
+        for (const [name, type] of columns) {
+            if (!existing.has(name)) {
+                db.run(`ALTER TABLE installment_plans ADD COLUMN ${name} ${type}`);
+            }
+        }
+    });
+}
 
 module.exports = db;
